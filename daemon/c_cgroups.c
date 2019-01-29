@@ -1054,3 +1054,108 @@ c_cgroups_cleanup(c_cgroups_t *cgroups)
 
 	list_delete(cgroups->assigned_devs);
 }
+
+typedef struct {
+	c_cgroups_t *cgroups;
+	uint16_t id_product;
+	uint16_t id_vendor;
+	char *i_serial;
+	bool assign;
+} c_cgroups_usb_description_t;
+
+static int
+c_cgroups_sys_usb_devices_dir_foreach_cb(const char *path, const char *name, void *data)
+{
+	uint16_t id_product, id_vendor;
+	char buf[256];
+	int len;
+	bool found;
+	int dev[2];
+
+	char *id_product_file = mem_printf("%s/%s/idProduct", path, name);
+	char *id_vendor_file = mem_printf("%s/%s/idVendor", path, name);
+	char *i_serial_file = mem_printf("%s/%s/serial", path, name);
+	char *dev_file = mem_printf("%s/%s/dev", path, name);
+
+	c_cgroups_usb_description_t *cgusbd = data;
+
+	IF_FALSE_GOTO(file_exists(id_product_file), out);
+	IF_FALSE_GOTO(file_exists(id_vendor_file), out);
+	IF_FALSE_GOTO(file_exists(dev_file), out);
+
+	len = file_read(id_product_file, buf, 256);
+	IF_TRUE_GOTO((len < 4), out);
+	IF_TRUE_GOTO((scanf(buf, "%04x", &id_product) < 0), out);
+	found = (id_product == cgusbd->id_product);
+
+	len = file_read(id_product_file, buf, 256);
+	IF_TRUE_GOTO((len < 4), out);
+	IF_TRUE_GOTO((scanf(buf, "%04x", &id_vendor) < 0), out);
+	found &= (id_vendor == cgusbd->id_vendor);
+
+	if (file_exists(i_serial_file)) {
+		len = file_read(i_serial_file, buf, 256);
+		found &= (0 == strncmp(buf, cgusbd->i_serial, len));
+	} else {
+		buf[0] = '\0';
+	}
+	IF_FALSE_GOTO(found, out);
+
+	// major = minor = -1;
+	dev[0] = dev[1] = -1;
+	len = file_read(dev_file, buf, 256);
+	IF_TRUE_GOTO((scanf(buf, "%d:%d", &dev[0], &dev[1]) < 0), out);
+	IF_FALSE_GOTO((dev[0] > -1 && dev[1] > -1), out);
+
+	char *rule = mem_printf("c %d:%d rwm", dev[0], dev[1]);
+	INFO("Going to %s usb device %04x:%04x serial \"%s\" rule %s",
+			cgusbd->assign?"assign":"allow", id_product, id_vendor,
+			buf, rule);
+
+	if (cgusbd->assign)
+		c_cgroups_devices_assign(cgusbd->cgroups, rule);
+	else
+		c_cgroups_devices_allow(cgusbd->cgroups, rule);
+	mem_free(rule);
+
+	return 0;
+
+out:
+	mem_free(id_product_file);
+	mem_free(id_vendor_file);
+	mem_free(i_serial_file);
+	mem_free(dev_file);
+	return 0;
+}
+
+static int
+c_groups_usb_device_generic(uint16_t id_vendor, uint16_t id_product, char *i_serial, bool assign)
+{
+	int ret = 0;
+	char *sysfs_path = "/sys/bus/usb/devices";
+	c_cgroups_usb_description_t *cgusbd = mem_new0(c_cgroups_usb_description_t, 1);
+	cgusbd->id_vendor = id_vendor;
+	cgusbd->id_product = id_product;
+	cgusbd->i_serial = i_serial;
+	cgusbd->assign = assign;
+
+	if (dir_foreach("/sys/bus/usb/devices", &c_cgroups_sys_usb_devices_dir_foreach_cb, cgusbd) < 0) {
+		WARN("Could not open %s to find usb device!", sysfs_path);
+		ret = -1;
+	}
+
+	mem_free(cgusbd);
+	return ret;
+}
+
+int
+c_groups_usb_device_allow(uint16_t id_vendor, uint16_t id_product, char *i_serial)
+{
+	return c_groups_usb_device_generic(id_vendor, id_product, i_serial, false);
+}
+
+int
+c_groups_usb_device_assign(uint16_t id_vendor, uint16_t id_product, char *i_serial)
+{
+	return c_groups_usb_device_generic(id_vendor, id_product, i_serial, true);
+}
